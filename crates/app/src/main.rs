@@ -4,7 +4,8 @@
 //!   gdtf-viewer <fixture.gdtf> [options]
 //!
 //! Options:
-//!   --screenshot out.png        render one frame headless and exit
+//!   --screenshot out.png        render one frame headless and exit (--no-ui: scene only,
+//!                               --size WxH: resolution, default 1440x860)
 //!   --bench N [--size WxH]      render N frames headless and print timings
 //!   --continuous                redraw every frame and log frame stats every 2 s
 //!   --quality N                 fixed quality level 0 (lowest) ..5 (ultra); default automatic
@@ -78,6 +79,8 @@ fn main() -> Result<()> {
     let mut address: Option<u16> = None;
     let mut manual = false;
     let mut size = (2880, 1720); // 1440×860 at Retina scale
+    let mut size_given = false;
+    let mut no_ui = false;
     let mut orbit = Orbit::default();
     let mut mode = 0;
     let mut position: Vec<(AxisAttr, f32)> = Vec::new();
@@ -89,6 +92,7 @@ fn main() -> Result<()> {
             "--screenshot" => screenshot = Some(value("--screenshot")?),
             "--bench" => bench = Some(value("--bench")?.parse()?),
             "--continuous" => continuous = true,
+            "--no-ui" => no_ui = true,
             "--haze" => haze = Some(value("--haze")?.parse()?),
             "--no-haze" => haze = Some(0.0),
             "--bloom" => bloom = Some(value("--bloom")?.parse()?),
@@ -112,6 +116,7 @@ fn main() -> Result<()> {
                 let v = value("--size")?;
                 let (w, h) = v.split_once('x').context("--size WxH")?;
                 size = (w.parse()?, h.parse()?);
+                size_given = true;
             }
             "--view" => {
                 let v: Vec<f32> = value("--view")?
@@ -239,7 +244,8 @@ fn main() -> Result<()> {
     }
 
     if let Some(out) = screenshot {
-        return gpu::screenshot(&fx, &gobos, &mut scene, &orbit, (1440, 860), &out);
+        let size = if size_given { size } else { (1440, 860) };
+        return gpu::screenshot(&fx, &gobos, &mut scene, &orbit, size, &out, !no_ui);
     }
     if let Some(frames) = bench {
         return gpu::bench(&fx, &gobos, &mut scene, &orbit, size, frames);

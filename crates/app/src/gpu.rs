@@ -252,6 +252,7 @@ pub fn screenshot(
     orbit: &Orbit,
     size: (u32, u32),
     out: &str,
+    with_ui: bool,
 ) -> Result<()> {
     let mut off = Offscreen::new(fx, gobos, size)?;
     // Run the UI a few times so layout (panel sizes, fonts) settles; keep every texture
@@ -275,6 +276,7 @@ pub fn screenshot(
             off.frame(fx, scene, orbit, &mut phases, empty);
         }
     }
+    let output = if with_ui { output } else { off.ctx.run_ui(off.ui_input(), |_| {}) };
     off.frame(fx, scene, orbit, &mut phases, output);
     scene.simulate_motion = dt_free;
     off.save_png(out)
