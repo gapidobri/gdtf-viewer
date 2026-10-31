@@ -1,0 +1,9 @@
+[package]
+name = "fixture"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gdtf-loader = { path = "../gdtf-loader" }
+glam.workspace = true
+log.workspace = true

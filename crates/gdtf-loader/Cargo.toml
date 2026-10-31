@@ -1,0 +1,16 @@
+[package]
+name = "gdtf-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gdtf.workspace = true
+gltf.workspace = true
+image.workspace = true
+glam.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

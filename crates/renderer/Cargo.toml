@@ -1,0 +1,12 @@
+[package]
+name = "renderer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gdtf-loader = { path = "../gdtf-loader" }
+fixture = { path = "../fixture" }
+wgpu.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+log.workspace = true
