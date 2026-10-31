@@ -101,9 +101,9 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Linear sRGB (Rec.709 primaries) colour of a blackbody-ish white at `kelvin`, scaled to
+/// Working-space (linear Rec.2020) colour of a blackbody-ish white at `kelvin`, scaled to
 /// luminance Y = 1. Uses the Kim et al. (2002) Planckian-locus fit, valid 1667–25000 K.
-pub fn cct_to_linear_srgb(kelvin: f32) -> [f32; 3] {
+pub fn cct_to_working(kelvin: f32) -> [f32; 3] {
     let t = kelvin.clamp(1667.0, 25000.0) as f64;
     let (t2, t3) = (t * t, t * t * t);
     let x = if t <= 4000.0 {
@@ -119,20 +119,13 @@ pub fn cct_to_linear_srgb(kelvin: f32) -> [f32; 3] {
     } else {
         3.0817580 * x3 - 5.87338670 * x2 + 3.75112997 * x - 0.37001483
     };
-    xyy_to_linear_srgb(x as f32, y as f32, 1.0)
+    xyy_to_working(x as f32, y as f32, 1.0)
 }
 
-/// CIE xyY → linear sRGB. Negative components (out of gamut) are clipped.
-pub fn xyy_to_linear_srgb(x: f32, y: f32, big_y: f32) -> [f32; 3] {
-    if y <= 1e-6 {
-        return [0.0; 3];
-    }
-    let (bx, by, bz) = (x / y * big_y, big_y, (1.0 - x - y) / y * big_y);
-    [
-        (3.2404542 * bx - 1.5371385 * by - 0.4985314 * bz).max(0.0),
-        (-0.969266 * bx + 1.8760108 * by + 0.0415560 * bz).max(0.0),
-        (0.0556434 * bx - 0.2040259 * by + 1.0572252 * bz).max(0.0),
-    ]
+/// CIE xyY → working space (linear Rec.2020). The rare colours outside even Rec.2020
+/// (spectral-locus lasers) are clipped.
+pub fn xyy_to_working(x: f32, y: f32, big_y: f32) -> [f32; 3] {
+    crate::color::xyz_to_working(crate::color::xyy_to_xyz(x, y, big_y)).map(|v| v.max(0.0))
 }
 
 /// Runtime state of one light-emitting Beam geometry.
@@ -146,8 +139,10 @@ pub struct BeamState {
     pub peak_cd: f32,
     /// Colour, gobos and focus from the optical train ([`crate::Optics::evaluate`]).
     pub look: BeamLook,
-    /// Current field angle (zoom), degrees.
+    /// Current field angle (zoom), degrees, before frost.
     pub field_angle: f32,
+    /// Current frost 0..1.
+    pub frost: f32,
     /// 0..1.
     pub dimmer: f32,
 }
@@ -161,37 +156,52 @@ impl BeamState {
             profile: BeamProfile::new(info.beam_angle, info.field_angle, info.shape),
             peak_cd: 0.0,
             look: BeamLook {
-                color: cct_to_linear_srgb(cct),
+                color: cct_to_working(cct),
                 color_split: None,
                 gobos: Vec::new(),
                 field_angle: None,
                 focus_distance: 5.0,
+                prism: None,
+                frost: 0.0,
+                spectrum: None,
             },
             field_angle: info.field_angle,
+            frost: 0.0,
             dimmer: 1.0,
         };
-        b.set_field_angle(info.field_angle);
+        b.set_optics(info.field_angle, 0.0);
         b
     }
 
     /// Zoom: changes the field angle, scaling the beam angle with it. The flux stays the
     /// same, so a narrower beam gets a higher peak intensity.
     pub fn set_field_angle(&mut self, field: f32) {
+        self.set_optics(field, self.look.frost);
+    }
+
+    /// Zoom and frost. Frost diffuses the beam: the beam angle grows towards the field,
+    /// the field widens by up to 80% and the edge softens. Flux is kept, so the peak drops.
+    fn set_optics(&mut self, field: f32, frost: f32) {
         let field = field.max(0.1);
-        if self.peak_cd > 0.0 && (field - self.field_angle).abs() < 1e-4 {
+        let frost = frost.clamp(0.0, 1.0);
+        if self.peak_cd > 0.0 && (field - self.field_angle).abs() < 1e-4 && (frost - self.frost).abs() < 1e-4 {
             return;
         }
         let ratio = if self.info.field_angle > 0.0 { self.info.beam_angle / self.info.field_angle } else { 1.0 };
         self.field_angle = field;
-        self.profile = BeamProfile::new(field * ratio, field, self.info.shape);
+        self.frost = frost;
+        let beam = field * ratio;
+        let frosted_field = field * (1.0 + 0.8 * frost);
+        let frosted_beam = beam + (frosted_field * 0.85 - beam).max(0.0) * frost;
+        let shape = if frost > 0.05 { BeamShape::Soft } else { self.info.shape };
+        self.profile = BeamProfile::new(frosted_beam, frosted_field, shape);
         self.peak_cd = self.info.luminous_flux.max(0.0) / self.profile.solid_angle().max(1e-6);
     }
 
-    /// Applies an evaluated look (colour, gobos, zoom, focus).
+    /// Applies an evaluated look (colour, gobos, prism, zoom, focus, frost).
     pub fn set_look(&mut self, look: BeamLook) {
-        if let Some(z) = look.field_angle {
-            self.set_field_angle(z);
-        }
+        let field = look.field_angle.unwrap_or(self.field_angle);
+        self.set_optics(field, look.frost);
         self.look = look;
     }
 
@@ -281,13 +291,13 @@ mod tests {
     fn cct_colours() {
         // A 6504 K blackbody is close to, but slightly magenta of, D65 (D65 lies just
         // above the Planckian locus), so allow a few percent.
-        let d65 = cct_to_linear_srgb(6504.0);
+        let d65 = cct_to_working(6504.0);
         assert!(d65.iter().all(|&c| approx(c, 1.0, 0.06)), "{d65:?}");
         assert!(d65[1] < d65[0] && d65[1] < d65[2]);
-        let tungsten = cct_to_linear_srgb(3200.0);
+        let tungsten = cct_to_working(3200.0);
         assert!(tungsten[0] > tungsten[1] && tungsten[1] > tungsten[2]);
         // Luminance-normalised.
-        let y = 0.2126 * tungsten[0] + 0.7152 * tungsten[1] + 0.0722 * tungsten[2];
+        let y = crate::color::luminance(tungsten);
         assert!(approx(y, 1.0, 0.01), "{y}");
     }
 }

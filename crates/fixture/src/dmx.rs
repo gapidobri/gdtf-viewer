@@ -58,6 +58,9 @@ pub struct Set {
     pub dmx_from: u64,
     /// 0-based wheel slot.
     pub slot: Option<u32>,
+    /// The set's own physical range, if it has one. For wheel slots this is the offset
+    /// from the slot centre in slots (e.g. −0.5..0.5: fine positioning / split colours).
+    pub physical: Option<(f32, f32)>,
 }
 
 /// Result of evaluating one channel.
@@ -285,7 +288,15 @@ impl DmxPatch {
         let set = f.sets.iter().rposition(|s| s.dmx_from <= value);
         let slot = set.and_then(|si| {
             if let Some(s) = f.sets[si].slot {
-                return Some(s as f32);
+                // Within the set, its own physical range (if any) moves the wheel off the
+                // slot centre: "positioning" ranges, e.g. −0.5..+0.5 slot.
+                let offset = f.sets[si].physical.map_or(0.0, |(a, b)| {
+                    let start = f.sets[si].dmx_from;
+                    let end = f.sets.get(si + 1).map_or(end, |n| n.dmx_from.saturating_sub(1));
+                    let t = if end > start { (value - start) as f32 / (end - start) as f32 } else { 0.0 };
+                    a + (b - a) * t.clamp(0.0, 1.0)
+                });
+                return Some(s as f32 + offset);
             }
             // A set without a slot between two slot sets (e.g. a split colour): position
             // between them in proportion to the value.
@@ -313,7 +324,13 @@ fn function_from(
         .map(|s| Set {
             name: s.name.as_deref().unwrap_or_default().to_owned(),
             dmx_from: to_res(&s.dmx_from),
-            slot: s.wheel_slot_index.filter(|&w| w >= 1).map(|w| w as u32 - 1),
+            // The gdtf crate already converts the file's 1-based index to 0-based (and the
+            // file's 0, "no slot", to -1).
+            slot: s.wheel_slot_index.filter(|&w| w >= 0).map(|w| w as u32),
+            physical: match (s.physical_from, s.physical_to) {
+                (Some(a), Some(b)) if a != 0.0 || b != 0.0 => Some((a as f32, b as f32)),
+                _ => None,
+            },
         })
         .collect();
     sets.sort_by_key(|s| s.dmx_from);
@@ -367,9 +384,9 @@ mod tests {
         let mut mode = func("Gobo2Index", "Gobo2", 0, (0.0, 1.0), None);
         mode.wheel = Some("RotatingGoboWheel".into());
         mode.sets = vec![
-            Set { name: "Open".into(), dmx_from: 0, slot: Some(0) },
-            Set { name: "Gobo 1".into(), dmx_from: 5, slot: Some(1) },
-            Set { name: "Gobo 2".into(), dmx_from: 8, slot: Some(2) },
+            Set { name: "Open".into(), dmx_from: 0, slot: Some(0), physical: None },
+            Set { name: "Gobo 1".into(), dmx_from: 5, slot: Some(1), physical: None },
+            Set { name: "Gobo 2".into(), dmx_from: 8, slot: Some(2), physical: Some((-0.5, 0.5)) },
         ];
         let rot = func("Gobo2Rotation", "Gobo2", 32, (0.0, 1.0), None);
         let m = |from, to| Some(Master { channel: 0, function: None, from, to });
@@ -431,9 +448,14 @@ mod tests {
     fn channel_sets_select_wheel_slots() {
         let p = megapointe_like();
         let mut v = p.default_values();
-        p.set(&mut v, 0, 9);
+        p.set(&mut v, 0, 6);
         let e = p.evaluate(&v)[0];
-        assert_eq!(e.set, Some(2));
-        assert_eq!(e.slot, Some(2.0));
+        assert_eq!(e.set, Some(1));
+        assert_eq!(e.slot, Some(1.0));
+        // A positioning set (−0.5..0.5 over 8..=31): its start is half a slot early.
+        p.set(&mut v, 0, 8);
+        assert_eq!(p.evaluate(&v)[0].slot, Some(1.5));
+        p.set(&mut v, 0, 31);
+        assert_eq!(p.evaluate(&v)[0].slot, Some(2.5));
     }
 }

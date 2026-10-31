@@ -34,6 +34,8 @@ pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const MAX_LIGHTS: usize = 4;
 const SHADOW_SIZE: u32 = 2048;
 const PROFILE_SAMPLES: usize = 256;
+/// Prism facets evaluated per light; prisms with more (e.g. 32-facet) are thinned evenly.
+pub const MAX_FACETS: usize = 16;
 /// Gobo textures are resampled to this size (GDTF recommends 256×256).
 pub const GOBO_SIZE: u32 = 256;
 /// Wheel slot pitch relative to the aperture (slots sit slightly further apart than the
@@ -81,6 +83,10 @@ struct LightUniform {
     /// Projector right / up unit vectors.
     basis_x: [f32; 4],
     basis_y: [f32; 4],
+    /// Up to [`MAX_FACETS`] prism facets, 3 × vec4 each (see common.wgsl).
+    prism: [[f32; 4]; 3 * MAX_FACETS],
+    /// x = facet count, y = cone half-angle holding all light (rad), z = frost gobo blur.
+    prism_params: [f32; 4],
     profile: [f32; PROFILE_SAMPLES],
 }
 
@@ -161,6 +167,8 @@ pub struct Renderer {
     linear_sampler: wgpu::Sampler,
     /// Volumetric haze settings.
     pub haze: Haze,
+    /// Volume resolution: full-res pixels per volume pixel (2 = half, 4 = quarter).
+    pub volume_scale: u32,
     /// Glare: fraction of the image replaced by its blurred version (0 = off).
     pub bloom_strength: f32,
     pub tonemapper: Tonemapper,
@@ -514,6 +522,7 @@ impl Renderer {
             }),
             haze: Haze::default(),
             bloom_strength: 0.04,
+            volume_scale: 2,
             tonemapper: Tonemapper::default(),
             fixture_placement: default_fixture_placement(),
             ev100: 7.0,
@@ -576,7 +585,7 @@ impl Renderer {
     }
 
     fn ensure_targets(&mut self, device: &wgpu::Device, size: (u32, u32)) {
-        if self.targets.as_ref().is_some_and(|t| t.size == size) {
+        if self.targets.as_ref().is_some_and(|t| t.size == size) && self.volume.scale() == self.volume_scale {
             return;
         }
         let tex = |label, format, usage| {
@@ -602,7 +611,7 @@ impl Renderer {
             DEPTH_FORMAT,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
-        self.volume.resize(device, size, &depth);
+        self.volume.resize(device, size, &depth, self.volume_scale);
         let hdr = tex(
             "hdr",
             HDR_FORMAT,
@@ -644,6 +653,16 @@ impl Renderer {
         (self.fixture_placement * GDTF_TO_Y_UP * fixture_transform).w_axis.truncate()
     }
 
+    /// GPU time of the last measured frame (first pass start to last pass end), ms.
+    pub fn gpu_frame_ms(&self) -> Option<f32> {
+        self.timer.as_ref().map(|t| t.frame_ms).filter(|&ms| ms > 0.0)
+    }
+
+    /// Number of GPU frame measurements so far (to tell new samples from repeats).
+    pub fn gpu_samples(&self) -> u64 {
+        self.timer.as_ref().map_or(0, |t| t.samples)
+    }
+
     /// Latest GPU time per pass in milliseconds (names in [`GPU_PASSES`]), if the device
     /// supports timestamp queries. Lags a frame or two behind.
     pub fn gpu_pass_times(&self) -> Option<[f32; GPU_PASSES.len()]> {
@@ -670,7 +689,7 @@ impl Renderer {
     ) {
         self.ensure_targets(device, size);
         if let Some(t) = &mut self.timer {
-            t.begin_frame();
+            t.begin_frame(device);
         }
         let root = self.fixture_placement * GDTF_TO_Y_UP;
 
@@ -1000,7 +1019,9 @@ fn light_uniform(
 
     let up = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
     let view = glam::camera::rh::view::look_to_mat4(apex, dir, up);
-    let fov = (2.0 * max_angle + 2f32.to_radians()).min(170f32.to_radians());
+    let (prism, prism_params) = prism_uniform(b, max_angle);
+    let cone = prism_params[1];
+    let fov = (2.0 * cone + 2f32.to_radians()).min(170f32.to_radians());
     // Near plane just past the lens so the fixture's own head doesn't shadow its beam.
     let proj = glam::camera::rh::proj::directx::perspective(fov, 1.0, apex_offset + 0.02, 80.0);
     let view_proj = proj * view;
@@ -1043,9 +1064,55 @@ fn light_uniform(
         // Same frame as glam's look_to_rh used for the shadow projector.
         basis_x: dir.cross(up).normalize().extend(0.0).into(),
         basis_y: dir.cross(up).normalize().cross(dir).extend(0.0).into(),
+        prism,
+        prism_params,
         profile,
     };
     (light, view_proj)
+}
+
+/// Prism facets as inverse transforms (output direction → unaltered beam, radius units)
+/// with the prism's rotation folded in, energy weights 1/(N·|det A|), and the cone that
+/// holds all the light. Also carries frost's extra gobo blur.
+fn prism_uniform(b: &BeamState, max_angle: f32) -> ([[f32; 4]; 3 * MAX_FACETS], [f32; 4]) {
+    let mut out = [[0.0; 4]; 3 * MAX_FACETS];
+    let tan_field = b.profile.half_field.to_radians().tan().max(1e-4);
+    // Where the unaltered beam ends, in radius units.
+    let extent = max_angle.tan() / tan_field;
+    let frost_blur = b.look.frost * 0.35;
+    let Some(prism) = b.look.prism.as_ref().filter(|p| !p.facets.is_empty()) else {
+        return (out, [0.0, max_angle, frost_blur, extent]);
+    };
+    // Thin evenly when there are more facets than we evaluate.
+    let n = prism.facets.len();
+    let take: Vec<&fixture::Facet> = (0..n.min(MAX_FACETS)).map(|k| &prism.facets[k * n / n.min(MAX_FACETS)]).collect();
+    let (sin_r, cos_r) = (-prism.rotation_deg).to_radians().sin_cos();
+    let mut reach = 0.0f32;
+    for (k, f) in take.iter().enumerate() {
+        let det = f.det();
+        if det.abs() < 1e-6 {
+            continue;
+        }
+        // A⁻¹ (column-major [a00, a10, a01, a11]).
+        let inv = [f.a[3] / det, -f.a[1] / det, -f.a[2] / det, f.a[0] / det];
+        // Rotating the prism by θ: u = R(θ)(A u₀ + t) ⇒ u₀ = A⁻¹ R(−θ) u − A⁻¹ t.
+        let m = [
+            inv[0] * cos_r + inv[2] * sin_r,
+            inv[1] * cos_r + inv[3] * sin_r,
+            -inv[0] * sin_r + inv[2] * cos_r,
+            -inv[1] * sin_r + inv[3] * cos_r,
+        ];
+        let o = [-(inv[0] * f.t[0] + inv[2] * f.t[1]), -(inv[1] * f.t[0] + inv[3] * f.t[1])];
+        let weight = 1.0 / (take.len() as f32 * det.abs());
+        out[3 * k] = m;
+        out[3 * k + 1] = [o[0], o[1], weight, 0.0];
+        out[3 * k + 2] = [f.tint[0], f.tint[1], f.tint[2], 0.0];
+        // Furthest the facet's image reaches: |t| + largest stretch × extent.
+        let stretch = (f.a[0] * f.a[0] + f.a[1] * f.a[1]).max(f.a[2] * f.a[2] + f.a[3] * f.a[3]).sqrt();
+        reach = reach.max((f.t[0] * f.t[0] + f.t[1] * f.t[1]).sqrt() + stretch * extent);
+    }
+    let cone = (reach * tan_field).atan().max(max_angle).min(fixture::MAX_HALF_ANGLE.to_radians());
+    (out, [take.len() as f32, cone, frost_blur, extent])
 }
 
 /// `lens`: (light index, luminance scale) if this part is the emitting lens of a beam.
@@ -1053,7 +1120,11 @@ fn draw_uniform(model: Mat4, m: &Material, lens: Option<(usize, f32)>) -> DrawUn
     DrawUniform {
         model: model.to_cols_array_2d(),
         normal: model.inverse().transpose().to_cols_array_2d(),
-        base_color: m.base_color,
+        // Materials (glTF, stage) are linear sRGB; the renderer works in Rec.2020.
+        base_color: {
+            let c = fixture::color::srgb_linear_to_working([m.base_color[0], m.base_color[1], m.base_color[2]]);
+            [c[0], c[1], c[2], m.base_color[3]]
+        },
         params: [
             m.metallic,
             m.roughness,
@@ -1188,7 +1259,14 @@ fn create_gobo_texture(
         map.insert(name.clone(), layers.len() as u32);
         // The gobo sits in the round field stop: mask it, so nothing outside the
         // inscribed circle passes (some files have opaque white corners there).
-        layers.push(px.iter().zip(&gobo_mask).map(|(p, a)| p.map(|c| c * a[0])).collect());
+        // Gobo glass colours are sRGB (GDTF Annex E); convert to the working space. All of
+        // Rec.709 lies inside Rec.2020, so transmissions stay within 0..1.
+        layers.push(
+            px.iter()
+                .zip(&gobo_mask)
+                .map(|(p, a)| fixture::color::srgb_linear_to_working(*p).map(|c| (c * a[0]).clamp(0.0, 1.0)))
+                .collect(),
+        );
     }
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("gobos"),

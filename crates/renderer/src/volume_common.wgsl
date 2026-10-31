@@ -9,6 +9,8 @@ struct Volume {
     sizes: vec4<f32>,
     // x = near, y = far, z = history blend weight (1 = no history), w = max march distance
     misc: vec4<f32>,
+    // x = full-resolution pixels per volume pixel (2 = half resolution, 4 = quarter)
+    extra: vec4<f32>,
 };
 
 // World position of a full-resolution pixel at depth-buffer value `d`.

@@ -38,6 +38,13 @@ struct Light {
     // Projector frame: right and up unit vectors (gobo image x and y).
     basis_x: vec4<f32>,
     basis_y: vec4<f32>,
+    // Prism facets, 3 vec4 each: inverse 2×2 (column-major), [offset.xy, weight, _],
+    // [tint.rgb, _]. Maps a beam direction back to the unaltered beam (radius units).
+    prism: array<vec4<f32>, 48>,
+    // x = facet count (0 = no prism), y = half-angle (rad) of the cone holding all light
+    // (prism spread included), z = extra gobo blur from frost (gobo uv units),
+    // w = extent of the unaltered beam (radius units; beyond it the profile is zero)
+    prism_params: vec4<f32>,
     // Relative intensity sampled evenly over 0..max angle, 4 per vec4.
     profile: array<vec4<f32>, 64>,
 };
@@ -119,25 +126,83 @@ fn gobo_wheel(g: vec4<f32>, uv: vec2<f32>, lod: f32, pitch: f32) -> vec3<f32> {
 }
 
 // Light transmission through colour wheel and gobos towards a world position.
-fn beam_filter(i: u32, world: vec3<f32>) -> vec3<f32> {
-    let l = &lights.items[i]; // pointer: copying the 1.3 KB struct spills registers
+// Light of beam `i` reaching `world`, relative to its peak intensity: the angular profile
+// times gobo/colour transmission, summed over prism facets. Coordinates are tangents of
+// the angle off the axis divided by tan(half field), i.e. in units of the beam's radius,
+// which is also the unit of GDTF prism facet transforms.
+fn beam_light(i: u32, world: vec3<f32>) -> vec3<f32> {
+    return beam_light_facets(i, world, 1u, 0u);
+}
+
+// As beam_light, but only every `stride`-th prism facet starting at `first`, weighted up
+// accordingly (the volume alternates subsets between frames; temporal smoothing sums them).
+fn beam_light_facets(i: u32, world: vec3<f32>, stride: u32, first: u32) -> vec3<f32> {
+    let l = &lights.items[i]; // pointer: copying the struct spills registers
+    let axis = l.dir.xyz;
+    let tan_field = l.optics.x;
+    let bx = l.basis_x.xyz;
+    let by = l.basis_y.xyz;
+
+    // Direction from the virtual apex (beam profile) ...
+    let to_p = world - l.apex.xyz;
+    let ax_a = dot(to_p, axis);
+    if ax_a <= 1e-5 {
+        return vec3<f32>(0.0);
+    }
+    let lat_a = to_p - axis * ax_a;
+    let na = vec2<f32>(dot(lat_a, bx), dot(lat_a, by)) / (ax_a * tan_field);
+    // ... and from the lens centre (gobo, see gobo_filter).
+    let rel = world - l.lens.xyz;
+    let ax = max(dot(rel, axis), 1e-4);
+    let lat = rel - axis * ax;
+    let nl = vec2<f32>(dot(lat, bx), dot(lat, by)) / (ax * tan_field);
+    // Blur radius in gobo uv: defocus (lens radius × |1/d_focus − 1/d|) plus frost.
+    let radius = l.lens.w * abs(l.gobo_params.z - 1.0 / ax) / tan_field * 0.5 + l.prism_params.z;
+
+    let facets = u32(l.prism_params.x);
+    if facets == 0u {
+        return unaltered_beam(i, na, nl, radius);
+    }
+    var sum = vec3<f32>(0.0);
+    let extent2 = l.prism_params.w * l.prism_params.w;
+    let stride_c = min(stride, facets);
+    for (var f = first % stride_c; f < facets; f += stride_c) {
+        let m = l.prism[3u * f];
+        let o = l.prism[3u * f + 1u];
+        let a0 = vec2<f32>(m.x * na.x + m.z * na.y, m.y * na.x + m.w * na.y) + o.xy;
+        // Most points lie in few facet images: skip the rest before any lookups.
+        if dot(a0, a0) >= extent2 {
+            continue;
+        }
+        let l0 = vec2<f32>(m.x * nl.x + m.z * nl.y, m.y * nl.x + m.w * nl.y) + o.xy;
+        sum += l.prism[3u * f + 2u].rgb * (o.z * f32(stride_c)) * unaltered_beam(i, a0, l0, radius);
+    }
+    return sum;
+}
+
+// The beam without prism, at normalized apex direction `na` / lens direction `nl`.
+fn unaltered_beam(i: u32, na: vec2<f32>, nl: vec2<f32>, radius: f32) -> vec3<f32> {
+    let l = &lights.items[i];
+    let prof = profile(i, atan(length(na) * l.optics.x));
+    if prof <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    return prof * gobo_filter(i, nl, radius);
+}
+
+// Gobo and colour wheel transmission. A point p receives light from every point q of the
+// lens; the ray q→p carries the gobo value at direction
+//     p/d + q·(1/d_focus − 1/d)        (d = distance along the axis),
+// so the gobo is seen blurred over a disc centred on the direction from the lens *centre*
+// (`nl`), with radius r·|1/d_focus − 1/d| (`radius`, gobo uv). Sharp at the focus distance;
+// near the lens only the part of the gobo "visible" through the lens contributes.
+fn gobo_filter(i: u32, nl: vec2<f32>, radius: f32) -> vec3<f32> {
+    let l = &lights.items[i];
     let count = u32(l.gobo_params.x);
     if count == 0u && l.split_a.w < 0.5 {
         return vec3<f32>(1.0);
     }
-    // Where the gobo plane is seen from `world`. A point p receives light from every point
-    // q of the lens; the ray q→p carries the gobo value at direction
-    //     p/d + q·(1/d_focus − 1/d)        (tan units, d = distance along the axis),
-    // so the gobo is seen blurred over a disc centred on the direction from the lens
-    // *centre*, with radius r·|1/d_focus − 1/d|. Sharp at the focus distance, and near
-    // the lens only the part of the gobo "visible" through the lens contributes.
-    let axis = l.dir.xyz;
-    let rel = world - l.lens.xyz;
-    let ax = max(dot(rel, axis), 1e-4);
-    let lat = rel - axis * ax;
-    let tan_field = l.optics.x;
-    let c = vec2<f32>(dot(lat, l.basis_x.xyz), dot(lat, l.basis_y.xyz)) / (ax * tan_field) * vec2<f32>(0.5, -0.5) + 0.5;
-    let radius = l.lens.w * abs(l.gobo_params.z - 1.0 / ax) / tan_field * 0.5; // in gobo uv
+    let c = nl * vec2<f32>(0.5, -0.5) + 0.5;
 
     // The field stop (open aperture, layer 0) is the disc of radius ½ around the centre.
     // Pick where to sample and how blurred, so the lookup covers the part of the blur disc

@@ -44,6 +44,8 @@ struct VolumeUniform {
     haze: [f32; 4],
     sizes: [f32; 4],
     misc: [f32; 4],
+    /// x = full-res pixels per volume pixel (2 = half resolution, 4 = quarter).
+    extra: [f32; 4],
 }
 
 /// Camera data the volume needs for one frame.
@@ -55,6 +57,7 @@ pub struct VolumeFrame {
 }
 
 struct Targets {
+    scale: u32,
     full: (u32, u32),
     half: (u32, u32),
     raw: wgpu::TextureView,
@@ -238,8 +241,14 @@ impl VolumePass {
     }
 
     /// (Re)creates the half-resolution targets. `depth` is the full-resolution scene depth.
-    pub fn resize(&mut self, device: &wgpu::Device, full: (u32, u32), depth: &wgpu::TextureView) {
-        let half = (full.0.div_ceil(2).max(1), full.1.div_ceil(2).max(1));
+    /// Full-res pixels per volume pixel of the current targets.
+    pub fn scale(&self) -> u32 {
+        self.targets.as_ref().map_or(0, |t| t.scale)
+    }
+
+    pub fn resize(&mut self, device: &wgpu::Device, full: (u32, u32), depth: &wgpu::TextureView, scale: u32) {
+        let scale = scale.clamp(1, 8);
+        let half = (full.0.div_ceil(scale).max(1), full.1.div_ceil(scale).max(1));
         let tex = |label| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -294,6 +303,7 @@ impl VolumePass {
             })
         });
         self.targets = Some(Targets {
+            scale,
             full,
             half,
             raw,
@@ -337,6 +347,7 @@ impl VolumePass {
             ],
             sizes: [t.full.0 as f32, t.full.1 as f32, t.half.0 as f32, t.half.1 as f32],
             misc: [frame.near, frame.far, history_weight, 60.0],
+            extra: [t.scale as f32, 0.0, 0.0, 0.0],
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&u));
 

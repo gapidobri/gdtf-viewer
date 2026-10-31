@@ -1,5 +1,6 @@
-// HDR (nits) → display: mix in bloom, apply exposure (from EV100), tonemap (AgX or
-// ACES), dither. Output is display-linear; the sRGB render target view encodes it.
+// HDR (nits, linear Rec.2020) → display: mix in bloom, apply exposure (from EV100),
+// convert to Rec.709 with gamut compression, tonemap (AgX or ACES), dither. Output is
+// display-linear; the sRGB render target view encodes it.
 
 struct Params {
     // x = exposure multiplier, y = bloom strength, z = tonemapper (0 ACES, 1 AgX),
@@ -52,6 +53,24 @@ fn agx(c: vec3<f32>) -> vec3<f32> {
     return pow(clamp(v, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
 }
 
+// Rec.2020 → Rec.709, then pull colours outside Rec.709 (deep LED blues, saturated
+// greens) towards their luminance until no channel is negative: keeps hue and brightness
+// instead of clipping a channel.
+fn to_rec709_compressed(c: vec3<f32>) -> vec3<f32> {
+    let m = mat3x3<f32>(
+        vec3<f32>(1.660491, -0.1245505, -0.0181508),
+        vec3<f32>(-0.5876411, 1.1328999, -0.1005789),
+        vec3<f32>(-0.0728499, -0.0083494, 1.1187297),
+    );
+    let r = m * c;
+    let y = dot(r, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let lo = min(r.r, min(r.g, r.b));
+    if lo >= 0.0 || y <= 0.0 {
+        return max(r, vec3<f32>(0.0));
+    }
+    return y + (r - y) * (y / (y - lo));
+}
+
 fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3<f32>(0.0031308));
 }
@@ -65,7 +84,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let size = vec2<f32>(textureDimensions(hdr));
     let scene = textureLoad(hdr, vec2<i32>(pos.xy), 0).rgb;
     let glare = textureSampleLevel(bloom, bloom_sampler, pos.xy / size, 0.0).rgb / max(p.params.w, 1.0);
-    let exposed = mix(scene, glare, p.params.y) * p.params.x;
+    let exposed = to_rec709_compressed(mix(scene, glare, p.params.y) * p.params.x);
     let c = select(aces(exposed), agx(exposed), p.params.z > 0.5);
     // Dither with ±1 LSB triangular noise in 8-bit sRGB output, so smooth dark
     // gradients (haze falloff, beam edges) don't band. The target view is sRGB, so add

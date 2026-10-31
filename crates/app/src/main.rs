@@ -7,6 +7,7 @@
 //!   --screenshot out.png        render one frame headless and exit
 //!   --bench N [--size WxH]      render N frames headless and print timings
 //!   --continuous                redraw every frame and log frame stats every 2 s
+//!   --quality N                 fixed quality level 0 (lowest) ..5 (ultra); default automatic
 //!   --haze DENSITY / --no-haze  haze scattering coefficient (1/m) or no volumetrics
 //!   --bloom S / --tonemap agx|aces  glare strength (0 = off) / display transform
 //!   --dmx ADDR=V,...            DMX control with these slot values (1-based within the fixture;
@@ -25,12 +26,14 @@
 //!   --cmy C,M,Y                 CMY flags 0..1
 //!   --cto K / --zoom DEG        CTO colour temperature / zoom field angle
 //!   --focus-dist M              distance at which gobos are sharp
+//!   --frost F                   frost 0..1 (prisms: --wheel Prism1=1)
 //!
 //! Controls: left-drag orbit, right-drag pan, scroll zoom, R reset view.
 
 mod gpu;
 mod orbit;
 mod net;
+mod quality;
 mod scene;
 mod stats;
 mod ui_paint;
@@ -65,6 +68,7 @@ fn main() -> Result<()> {
     let mut bench = None;
     let mut continuous = false;
     let mut target_lens = false;
+    let mut quality_level: Option<usize> = None;
     let mut off_axis: Option<f32> = None;
     let mut haze: Option<f32> = None;
     let mut bloom: Option<f32> = None;
@@ -131,6 +135,7 @@ fn main() -> Result<()> {
                 orbit.target = glam::Vec3::new(v[0], v[1], v[2]);
             }
             "--off-axis" => off_axis = Some(value("--off-axis")?.parse()?),
+            "--quality" => quality_level = Some(value("--quality")?.parse()?),
             "--mode" => mode = value("--mode")?.parse()?,
             "--pan" => {
                 manual = true;
@@ -146,7 +151,7 @@ fn main() -> Result<()> {
             }
             "--ev" => ev = Some(value("--ev")?.parse()?),
             "--house" => house = Some(value("--house")?.parse()?),
-            flag @ ("--wheel" | "--index" | "--cmy" | "--cto" | "--zoom" | "--focus-dist") => {
+            flag @ ("--wheel" | "--index" | "--cmy" | "--cto" | "--zoom" | "--focus-dist" | "--frost") => {
                 manual = true;
                 let v = value(flag)?;
                 optics_args.push((flag.to_owned(), v));
@@ -177,6 +182,11 @@ fn main() -> Result<()> {
     }
     if manual {
         scene.control = scene::Control::Manual;
+    }
+    if let Some(l) = quality_level {
+        anyhow::ensure!(l < quality::LEVELS.len(), "--quality 0..{}", quality::LEVELS.len() - 1);
+        scene.quality.enabled = false;
+        scene.quality.level = l;
     }
     for (addr, v) in dmx_values {
         anyhow::ensure!(
@@ -247,6 +257,7 @@ fn main() -> Result<()> {
         last_frame: Instant::now(),
         stats: stats::FrameStats::new(),
         settle_frames: 30,
+        gpu_samples_seen: 0,
     };
     app.stats.continuous = continuous;
     app.stats.log_every = continuous.then(|| std::time::Duration::from_secs(2));
@@ -275,6 +286,7 @@ struct App {
     stats: stats::FrameStats,
     /// Frames to keep redrawing after the last change, so temporal smoothing settles.
     settle_frames: u32,
+    gpu_samples_seen: u64,
 }
 
 impl ApplicationHandler for App {
@@ -373,7 +385,12 @@ impl App {
     fn redraw(&mut self) {
         let Some(st) = self.state.as_mut() else { return };
         let now = Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+        let gap = (now - self.last_frame).as_secs_f32();
+        if gap > 0.25 {
+            // Rendering paused: GPU clocks drop while idle, so re-measure from scratch.
+            self.scene.quality.restart_measuring();
+        }
+        let dt = gap.min(0.1);
         self.last_frame = now;
 
         let mut phases = stats::PhaseTimer::start();
@@ -406,6 +423,10 @@ impl App {
         st.renderer.ev100 = self.scene.view.ev100;
         st.renderer.house_lux = self.scene.view.house_lux;
         st.renderer.haze = self.scene.view.haze;
+        // Quality level (automatic, or picked in View) sets the volumetric cost.
+        let q = self.scene.quality.current();
+        st.renderer.haze.steps = q.steps;
+        st.renderer.volume_scale = q.volume_scale;
         st.renderer.bloom_strength = self.scene.view.bloom;
         st.renderer.tonemapper = self.scene.view.tonemapper;
         st.renderer.render(
@@ -436,6 +457,16 @@ impl App {
         st.gpu.queue.present(frame);
         phases.lap(5);
         self.stats.record(&phases, st.renderer.gpu_pass_times().as_ref().map(|t| &t[..]));
+        // Feed only fresh GPU measurements (the timer can lag a frame or two).
+        let samples = st.renderer.gpu_samples();
+        if samples != self.gpu_samples_seen
+            && let Some(ms) = st.renderer.gpu_frame_ms()
+        {
+            self.gpu_samples_seen = samples;
+            self.scene.quality.update(ms);
+            self.stats.gpu_frame = Some(ms);
+        }
+        self.stats.quality = self.scene.quality.enabled.then(|| self.scene.quality.current().name);
 
         let repaint_now = output
             .viewport_output
@@ -500,6 +531,7 @@ fn apply_optics_arg(scene: &mut Scene, flag: &str, v: &str) -> Result<()> {
         "--cto" => st.cto_k = Some(v.parse()?),
         "--zoom" => st.zoom_deg = Some(v.parse()?),
         "--focus-dist" => st.focus = fixture::focus_for_distance(v.parse()?),
+        "--frost" => st.frost = v.parse()?,
         _ => unreachable!(),
     }
     Ok(())

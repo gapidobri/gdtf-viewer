@@ -25,7 +25,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             hi = max(hi, s);
         }
     }
-    let full_px = vec2<f32>(p) * 2.0;
+    let full_px = vec2<f32>(p) * vol.extra.x;
     let d = textureLoad(scene_depth, vec2<i32>(full_px), 0);
     let world = world_at(vol.inv_view_proj, full_px + 0.5, vol.sizes.xy, d);
     let prev = vol.prev_view_proj * vec4<f32>(world, 1.0);

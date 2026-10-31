@@ -16,6 +16,10 @@ pub struct FrameStats {
     pub visible: bool,
     /// Redraw every frame (otherwise only on input/animation), for measuring.
     pub continuous: bool,
+    /// GPU time of the whole frame (first pass start to last pass end), ms.
+    pub gpu_frame: Option<f32>,
+    /// Current automatic quality level, if enabled.
+    pub quality: Option<&'static str>,
     /// Log a summary at this interval (for measuring without looking at the overlay).
     pub log_every: Option<Duration>,
     last_log: Option<Instant>,
@@ -68,8 +72,10 @@ impl FrameStats {
         {
             self.last_log = Some(now);
             log::info!(
-                "{} fps | cpu {:.2} ms {:?} | gpu {:?}",
+                "{} fps | quality {:?} | gpu frame {:?} ms | cpu {:.2} ms {:?} | gpu {:?}",
                 self.fps(),
+                self.quality,
+                self.gpu_frame.map(|v| (v * 100.0).round() / 100.0),
                 self.cpu_total(),
                 CPU_PHASES.iter().zip(self.cpu.map(|v| (v * 100.0).round() / 100.0)).collect::<Vec<_>>(),
                 self.gpu.as_ref().map(|g| g.iter().map(|(n, v)| (*n, (v * 100.0).round() / 100.0)).collect::<Vec<_>>()),
@@ -101,7 +107,7 @@ impl FrameStats {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.style_mut().override_font_id = Some(egui::FontId::monospace(11.0));
-                    let work = self.cpu_total().max(self.gpu_total().unwrap_or(0.0));
+                    let work = self.cpu_total().max(self.gpu_frame.or(self.gpu_total()).unwrap_or(0.0));
                     ui.strong(format!("{:>3} fps", self.fps()));
                     ui.label(format!(
                         "frame cost {:.1} ms (≈{:.0} fps max)",
@@ -113,7 +119,10 @@ impl FrameStats {
                     for (name, ms) in CPU_PHASES.iter().zip(self.cpu) {
                         ui.weak(format!("  {name:<8}{ms:>6.2}"));
                     }
-                    match (&self.gpu, self.gpu_total()) {
+                    if let Some(q) = self.quality {
+                        ui.label(format!("quality: {q} (auto)"));
+                    }
+                    match (&self.gpu, self.gpu_frame.or(self.gpu_total())) {
                         (Some(g), Some(total)) => {
                             ui.label(format!("GPU {total:>6.2} ms"));
                             for (name, ms) in g {

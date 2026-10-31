@@ -17,7 +17,8 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // Bilinear taps on the half-res grid, re-weighted by depth similarity so beams don't
     // bleed across silhouettes.
     let half_size = vec2<i32>(vol.sizes.zw);
-    let hp = (full_px + 0.5) * 0.5 - 0.5;
+    let scale = vol.extra.x;
+    let hp = (full_px + 0.5) / scale - 0.5;
     let base = floor(hp);
     let f = hp - base;
     var sum = vec3<f32>(0.0);
@@ -27,7 +28,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let o = vec2<f32>(f32(i), f32(j));
             let h = clamp(vec2<i32>(base + o), vec2<i32>(0), half_size - 1);
             let wb = select(1.0 - f.x, f.x, i == 1) * select(1.0 - f.y, f.y, j == 1);
-            let hz = linear_depth(textureLoad(scene_depth, h * 2, 0), near, far);
+            let hz = linear_depth(textureLoad(scene_depth, h * i32(scale), 0), near, far);
             let wd = exp(-abs(hz - z) / (0.02 * z + 0.02));
             let w = wb * wd + 1e-5;
             sum += textureLoad(volume_tex, h, 0).rgb * w;

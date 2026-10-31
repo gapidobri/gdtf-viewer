@@ -130,6 +130,15 @@ pub fn drive_beam(attrs: &NodeAttributes, rig: &FixtureRig, beam_node: usize, op
     if let Some(v) = near("Focus1") {
         state.focus = v.physical.clamp(0.0, 1.0);
     }
+    // Several frost filters (light/medium/heavy) can share a channel; use the strongest.
+    let frosts: Vec<f32> = ["Frost1", "Frost2", "Frost3"]
+        .iter()
+        .filter_map(|a| near(a))
+        .map(|v| v.physical.clamp(0.0, 1.0))
+        .collect();
+    if !frosts.is_empty() {
+        state.frost = frosts.into_iter().fold(0.0, f32::max);
+    }
     for (w, ws) in optics.wheels.iter().zip(&mut state.wheels) {
         let spin = near(&format!("{}WheelSpin", w.attr));
         ws.wheel_spin_dps = spin.map_or(0.0, |v| v.physical);

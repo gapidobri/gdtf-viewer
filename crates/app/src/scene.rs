@@ -62,6 +62,8 @@ pub struct Scene {
     pub beam_optics: Vec<OpticsState>,
     pub drives: Vec<BeamDrive>,
     pub net: NetInput,
+    /// Automatic quality (volumetric steps / resolution) to hold 60 fps.
+    pub quality: crate::quality::AutoQuality,
     time: f32,
 }
 
@@ -99,6 +101,8 @@ impl Scene {
             cto: None,
             zoom: None,
             has_focus: false,
+            has_frost: false,
+            spectral: Default::default(),
         };
         let mut s = Self {
             title: format!("{} {} — GDTF viewer", ft.manufacturer, ft.long_name),
@@ -133,6 +137,7 @@ impl Scene {
                 receiver: None,
                 error: None,
             },
+            quality: Default::default(),
             time: 0.0,
         };
         s.set_mode(fx, 0);
@@ -338,6 +343,7 @@ impl Scene {
 
                 if self.control == Control::Dmx {
                     egui::CollapsingHeader::new("Network input").default_open(false).show(ui, |ui| self.net_ui(ui));
+                    egui::CollapsingHeader::new("Light").default_open(false).show(ui, |ui| self.light_analysis_ui(ui));
                     egui::CollapsingHeader::new("DMX channels").default_open(true).show(ui, |ui| self.dmx_ui(ui));
                     egui::CollapsingHeader::new("Haze").default_open(false).show(ui, |ui| self.haze_ui(ui));
                     egui::CollapsingHeader::new("View").default_open(false).show(ui, |ui| self.view_ui(ui, show_stats, continuous));
@@ -347,7 +353,7 @@ impl Scene {
                 egui::CollapsingHeader::new("Position").default_open(true).show(ui, |ui| self.position_ui(ui));
                 egui::CollapsingHeader::new("Intensity & beam").default_open(true).show(ui, |ui| self.beam_ui(ui));
                 egui::CollapsingHeader::new("Colour").default_open(true).show(ui, |ui| self.colour_ui(ui));
-                egui::CollapsingHeader::new("Gobos").default_open(true).show(ui, |ui| self.gobo_ui(ui));
+                egui::CollapsingHeader::new("Gobos, prisms, frost").default_open(true).show(ui, |ui| self.gobo_ui(ui));
                 egui::CollapsingHeader::new("Haze").default_open(true).show(ui, |ui| self.haze_ui(ui));
                 egui::CollapsingHeader::new("View").default_open(true).show(ui, |ui| self.view_ui(ui, show_stats, continuous));
             });
@@ -368,8 +374,6 @@ impl Scene {
                 ui.label("Forward scattering (g)");
                 ui.add(egui::Slider::new(&mut h.anisotropy, 0.0..=0.9).fixed_decimals(2))
                     .on_hover_text("How much brighter the beam looks when you look towards the fixture");
-                ui.label("Quality (steps)");
-                ui.add(egui::Slider::new(&mut h.steps, 8..=128));
                 ui.checkbox(&mut h.temporal, "Temporal smoothing");
             });
         
@@ -391,6 +395,16 @@ impl Scene {
                 ui.selectable_value(&mut self.view.tonemapper, renderer::Tonemapper::Aces, "ACES")
                     .on_hover_text("Punchier, but bright saturated colours shift hue");
             });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.quality.enabled, "Auto quality")
+                    .on_hover_text("Adjust volumetric quality to hold 60 fps");
+                let q = self.quality.current();
+                ui.weak(format!("{} · {} steps · 1/{} res", q.name, q.steps, q.volume_scale));
+            });
+            if !self.quality.enabled {
+                let n = crate::quality::LEVELS.len() - 1;
+                ui.add(egui::Slider::new(&mut self.quality.level, 0..=n).text("quality level"));
+            }
             ui.checkbox(show_stats, "Frame stats");
             ui.checkbox(continuous, "Redraw continuously")
                 .on_hover_text("Normally the view only redraws on input or animation");
@@ -584,29 +598,106 @@ impl Scene {
                 wheel_ui(ui, w, ws);
             }
         }
-        let c = self.beams.first().map(|b| b.look.color).unwrap_or([1.0; 3]);
+        self.light_analysis_ui(ui);
+    }
+
+    /// Beam colour swatch, spectrum plot and CIE 1931 chromaticity diagram, for checking
+    /// against a data sheet.
+    fn light_analysis_ui(&self, ui: &mut egui::Ui) {
+        use fixture::color;
+        let Some(b) = self.beams.first() else { return };
+        // Include the colour wheel (applied in the shader as a split between two slots).
+        let c = match &b.look.color_split {
+            Some(sp) => std::array::from_fn(|k| b.look.color[k] * (sp.a[k] + (sp.b[k] - sp.a[k]) * sp.frac)),
+            None => b.look.color,
+        };
         let to8 = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
-        let m = c.iter().copied().fold(1e-6, f32::max);
+        let swatch = |c: color::Rgb| {
+            let s = color::working_to_srgb_linear(c);
+            let m = s.iter().copied().fold(1e-6, f32::max);
+            egui::Color32::from_rgb(to8(s[0] / m), to8(s[1] / m), to8(s[2] / m))
+        };
+        let xyz = match (&b.look.spectrum, &b.look.color_split) {
+            (Some(s), None) => s.to_xyz(),
+            _ => color::working_to_xyz(c),
+        };
+        let xy = color::xyz_to_xy(xyz);
         ui.horizontal(|ui| {
             ui.weak("Beam colour");
             let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 14.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, 2.0, egui::Color32::from_rgb(to8(c[0] / m), to8(c[1] / m), to8(c[2] / m)));
-            ui.weak(format!("{:.0}% lum", 100.0 * (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])));
+            ui.painter().rect_filled(rect, 2.0, swatch(c));
+            ui.weak(format!("{:.0}% lum  xy {:.3}, {:.3}", 100.0 * color::luminance(c), xy[0], xy[1]));
         });
+        let source = &self.optics.spectral.source_label;
+        ui.weak(match (&b.look.spectrum, source.is_empty()) {
+            (Some(_), false) => format!("Spectral: source {source}"),
+            (Some(_), true) => "Spectral: measured emitters".to_owned(),
+            (None, _) => "RGB approximation (no spectral data)".to_owned(),
+        });
+
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(280.0), 70.0), egui::Sense::hover());
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 2.0, egui::Color32::from_gray(18));
+        if let Some(sp) = &b.look.spectrum {
+            let max = sp.0.iter().copied().fold(1e-9, f32::max);
+            let n = sp.0.len();
+            for i in 0..n - 1 {
+                let x = |k: usize| rect.left() + rect.width() * k as f32 / (n - 1) as f32;
+                let y = |v: f32| rect.bottom() - rect.height() * (v / max) * 0.95;
+                let mono = color::xyz_to_working(color::cie_xyz(color::wavelength(i)));
+                p.line_segment(
+                    [egui::pos2(x(i), y(sp.0[i])), egui::pos2(x(i + 1), y(sp.0[i + 1]))],
+                    egui::Stroke::new(1.5, swatch(mono.map(|v| v.max(0.0)))),
+                );
+            }
+            p.text(rect.left_top() + egui::vec2(3.0, 2.0), egui::Align2::LEFT_TOP, "380–780 nm", egui::FontId::proportional(9.0), egui::Color32::GRAY);
+        }
+
+        // Chromaticity diagram: spectral locus, Rec.709 and Rec.2020 gamuts, the beam.
+        let side = 150.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 2.0, egui::Color32::from_gray(18));
+        let to = |x: f32, y: f32| egui::pos2(rect.left() + x / 0.8 * side, rect.bottom() - y / 0.9 * side);
+        let locus: Vec<egui::Pos2> = (380..=700)
+            .step_by(5)
+            .map(|l| {
+                let a = color::xyz_to_xy(color::cie_xyz(l as f32));
+                to(a[0], a[1])
+            })
+            .collect();
+        let mut closed = locus.clone();
+        closed.push(locus[0]);
+        p.add(egui::Shape::line(closed, egui::Stroke::new(1.0, egui::Color32::from_gray(140))));
+        for (prims, col) in [
+            ([(0.64, 0.33), (0.30, 0.60), (0.15, 0.06)], egui::Color32::from_gray(90)),
+            ([(0.708, 0.292), (0.170, 0.797), (0.131, 0.046)], egui::Color32::from_rgb(70, 90, 140)),
+        ] {
+            let mut pts: Vec<egui::Pos2> = prims.iter().map(|&(x, y)| to(x, y)).collect();
+            pts.push(pts[0]);
+            p.add(egui::Shape::line(pts, egui::Stroke::new(1.0, col)));
+        }
+        p.circle_filled(to(xy[0], xy[1]), 3.5, swatch(c));
+        p.circle_stroke(to(xy[0], xy[1]), 3.5, egui::Stroke::new(1.0, egui::Color32::WHITE));
+        p.text(rect.right_bottom() - egui::vec2(3.0, 3.0), egui::Align2::RIGHT_BOTTOM, "709 · 2020", egui::FontId::proportional(9.0), egui::Color32::GRAY);
     }
 
     fn gobo_ui(&mut self, ui: &mut egui::Ui) {
         let (o, st) = (&self.optics, &mut self.optics_state);
         let mut any = false;
         for (w, ws) in o.wheels.iter().zip(&mut st.wheels) {
-            if w.kind == WheelKind::Gobo {
+            if matches!(w.kind, WheelKind::Gobo | WheelKind::Prism) {
                 wheel_ui(ui, w, ws);
                 any = true;
             }
         }
+        if o.has_frost {
+            ui.add_space(4.0);
+            ui.add(egui::Slider::new(&mut st.frost, 0.0..=1.0).text("frost"));
+            any = true;
+        }
         if !any {
-            ui.label("No gobo wheels in this mode.");
+            ui.label("No gobo or prism wheels in this mode.");
         }
     }
 }

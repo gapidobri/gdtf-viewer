@@ -81,7 +81,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let half_px = floor(pos.xy);
     // Each half-res pixel uses the depth of its top-left full-res pixel (the composite
     // pass reads the same pixel for its depth-aware upsample).
-    let full_px = half_px * 2.0;
+    let full_px = half_px * vol.extra.x;
     let d = textureLoad(scene_depth, vec2<i32>(full_px), 0);
     let eye = vol.eye.xyz;
     let surface = world_at(vol.inv_view_proj, full_px + 0.5, vol.sizes.xy, d);
@@ -103,7 +103,8 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let axis = l.dir.xyz;
         let apex = l.apex.xyz;
         let lens_ax = dot(l.lens.xyz - apex, axis);
-        let seg = cone_interval(eye, v, apex, axis, cos(l.apex.w), lens_ax, vol.misc.w);
+        // The cone holding all of the beam's light, prism images included.
+        let seg = cone_interval(eye, v, apex, axis, cos(l.prism_params.y), lens_ax, vol.misc.w);
         let t0 = seg.x;
         let t1 = min(seg.y, t_surface);
         if t0 >= t1 {
@@ -112,21 +113,23 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // Steps follow the length of the segment: ~8 cm per step through gobo shafts
         // (sharp detail), ~25 cm through plain beams, capped by the quality setting.
         // Short crossings and wide floods get cheap.
-        let has_detail = l.gobo_params.x > 0.5 || l.split_a.w > 0.5;
+        let has_detail = l.gobo_params.x > 0.5 || l.split_a.w > 0.5 || l.prism_params.x > 0.5;
         let step_len = select(0.25, 0.08, has_detail);
         // Plain beams are smooth along the ray: 3/8 of the quality setting is plenty once
         // temporal smoothing averages the jittered samples.
         let max_steps = select(max(4.0, ceil(steps * 0.375)), steps, has_detail);
         let n = clamp(ceil((t1 - t0) / step_len), 4.0, max_steps);
         let dt = (t1 - t0) / n;
+        // Prisms with many facets: half of them per frame, alternating.
+        let facet_stride = select(1u, 2u, l.prism_params.x > 8.5);
+        let facet_first = u32(vol.haze.w) % 2u;
         var acc = vec3<f32>(0.0);
         for (var k = 0.0; k < n; k += 1.0) {
             let t = t0 + (k + jitter) * dt;
             let p = eye + v * t;
             let to_p = p - apex;
-            let theta = acos(clamp(dot(normalize(to_p), axis), -1.0, 1.0));
-            let prof = profile(li, theta);
-            if prof <= 0.0 {
+            let light = beam_light_facets(li, p, facet_stride, facet_first);
+            if max(light.r, max(light.g, light.b)) <= 0.0 {
                 continue;
             }
             let vis = shadow_point(li, p);
@@ -137,9 +140,9 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let phase = henyey_greenstein(dot(normalize(p - l.lens.xyz), -v), g);
             // Inverse square from the virtual apex (see forward.wgsl): finite at the lens,
             // where it equals flux / aperture area.
-            let lux = prof / max(dot(to_p, to_p), 1e-4) * vis;
+            let lux = vis / max(dot(to_p, to_p), 1e-4);
             // Haze between the eye and p attenuates what reaches us.
-            acc += beam_filter(li, p) * (lux * phase * exp(-sigma * t));
+            acc += light * (lux * phase * exp(-sigma * t));
         }
         radiance += l.color.rgb * acc * (sigma * dt);
     }

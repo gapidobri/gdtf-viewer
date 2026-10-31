@@ -178,6 +178,9 @@ impl Offscreen {
         self.renderer.ev100 = scene.view.ev100;
         self.renderer.house_lux = scene.view.house_lux;
         self.renderer.haze = scene.view.haze;
+        let q = scene.quality.current();
+        self.renderer.haze.steps = q.steps;
+        self.renderer.volume_scale = q.volume_scale;
         self.renderer.bloom_strength = scene.view.bloom;
         self.renderer.tonemapper = scene.view.tonemapper;
         self.renderer.render(

@@ -5,16 +5,17 @@
 
 mod axes;
 mod beam;
+pub mod color;
 pub mod control;
 pub mod dmx;
 mod optics;
 
 pub use axes::{axis_controls, AxisAttr, AxisControl, AxisMotion};
 pub use optics::{
-    focus_distance, focus_for_distance, BeamLook, ColorSplit, EmitterUse, FilterUse, GoboLook, Optics, OpticsState, Range,
+    focus_distance, focus_for_distance, BeamLook, Facet, PrismLook, ColorSplit, EmitterUse, FilterUse, GoboLook, Optics, OpticsState, Range,
     SlotOptics, WheelKind, WheelState, WheelUse,
 };
-pub use beam::{beams, cct_to_linear_srgb, xyy_to_linear_srgb, BeamProfile, BeamState};
+pub use beam::{beams, cct_to_working, xyy_to_working, BeamProfile, BeamState, MAX_HALF_ANGLE};
 
 use gdtf_loader::{BeamInfo, GeometryKind, GeometryNode, LoadedFixture};
 use glam::{Mat4, Vec3};

@@ -84,21 +84,19 @@ fn fs_main(i: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
             continue;
         }
         let to_p = i.world - l.apex.xyz;
-        let theta = acos(clamp(dot(normalize(to_p), l.dir.xyz), -1.0, 1.0));
-        let prof = profile(li, theta);
-        if prof <= 0.0 {
+        let light = beam_light(li, i.world);
+        if max(light.r, max(light.g, light.b)) <= 0.0 {
             continue;
         }
-        let lvec = l.lens.xyz - i.world;
-        let ldir = normalize(lvec);
+        let ldir = normalize(l.lens.xyz - i.world);
         // Inverse square from the beam's virtual apex, not the lens: the beam's cross
         // section grows from the lens aperture, so near the lens the illuminance tends to
         // flux / aperture area instead of diverging.
-        let lux = prof / max(dot(to_p, to_p), 1e-4) * shadow(li, i.world, n);
+        let lux = shadow(li, i.world, n) / max(dot(to_p, to_p), 1e-4);
         if lux <= 0.0 {
             continue;
         }
-        c += shade(n, v, ldir, albedo, metallic, rough) * l.color.rgb * beam_filter(li, i.world) * lux;
+        c += shade(n, v, ldir, albedo, metallic, rough) * l.color.rgb * light * lux;
     }
 
     // Lens. Seen from the eye, lens point q shows the gobo plane at (tan units)
